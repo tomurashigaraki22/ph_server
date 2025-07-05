@@ -1,0 +1,9 @@
+flask
+pyjwt
+flask_mail
+flask_cors
+pymysql
+python-dotenv
+paramiko  # For SSH operations
+zipfile36  # For handling zip files
+requests  # For HTTP operations
